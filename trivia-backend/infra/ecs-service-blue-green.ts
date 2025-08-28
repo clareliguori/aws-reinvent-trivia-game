@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 import {
   App,
-  CfnCodeDeployBlueGreenHook,
   CfnOutput,
-  CfnTrafficRoutingType,
   Duration,
   Stack,
   StackProps,
@@ -15,6 +13,7 @@ import {
   aws_ecr as ecr,
   aws_ecs as ecs,
   aws_elasticloadbalancingv2 as elb,
+  aws_lambda_nodejs as lambda,
   aws_route53 as route53,
   aws_route53_targets as targets,
   aws_ssm as ssm,
@@ -23,26 +22,13 @@ import {
 interface TriviaBackendStackProps extends StackProps {
   domainName: string;
   domainZone: string;
-  deploymentHooksStack: string;
 }
 
-/**
- * Always use the "cdk --no-version-reporting" flag with this example.
- * The CodeDeploy template hook prevents changes to the ECS resources and changes to non-ECS resources
- * from occurring in the same stack update, because the stack update cannot be done in a safe blue-green
- * fashion.  By default, the CDK inserts a `AWS::CDK::Metadata` resource into the template it generates.
- * If not using the `--no-version-reporting` option and the CDK libraries are upgraded, the
- * `AWS::CDK::Metadata` resource will change and can result in a validation error from the CodeDeploy hook
- * about non-ECS resource changes.
- */
 class TriviaBackendStack extends Stack {
   constructor(parent: App, name: string, props: TriviaBackendStackProps) {
     super(parent, name, props);
 
-    // Look up container image to deploy.
-    // Note that the image tag MUST be static in the generated CloudFormation template
-    // (for example, the tag value cannot come from a CFN stack parameter), or else CodeDeploy
-    // will not recognize when the tag changes and will not orchestrate any blue-green deployments.
+    // Look up container image to deploy
     const imageRepo = ecr.Repository.fromRepositoryName(
       this,
       'Repo',
@@ -52,14 +38,6 @@ class TriviaBackendStack extends Stack {
     const image = ecs.ContainerImage.fromEcrRepository(imageRepo, tag);
 
     // Network infrastructure
-    //
-    // Note: Generally, the best practice is to minimize the number of resources in the template that
-    // are not involved in the CodeDeploy blue-green deployment (i.e. that are not referenced by the
-    // CodeDeploy blue-green hook). As mentioned above, the CodeDeploy hook prevents stack updates
-    // that combine 'infrastructure' resource changes and 'blue-green' resource changes. Separating
-    // infrastructure resources like VPC, security groups, clusters, etc into a different stack and
-    // then referencing them in this stack would minimize the likelihood of that happening. But, for
-    // the simplicity of this example, these resources are all created in the same stack.
     const vpc = new ec2.Vpc(this, 'VPC', { maxAzs: 2 });
     const cluster = new ecs.Cluster(this, 'Cluster', {
       clusterName: props.domainName.replace(/\./g, '-'),
@@ -108,10 +86,8 @@ class TriviaBackendStack extends Stack {
       ),
     });
 
-    // Target groups:
-    // We need two target groups that the ECS containers can be registered to.
-    // CodeDeploy will shift traffic between these two target groups.
-    const tg1 = new elb.ApplicationTargetGroup(this, 'ServiceTargetGroupBlue', {
+    // Target groups for blue-green deployment
+    const blueTargetGroup = new elb.ApplicationTargetGroup(this, 'ServiceTargetGroupBlue', {
       port: 80,
       protocol: elb.ApplicationProtocol.HTTP,
       targetType: elb.TargetType.IP,
@@ -128,7 +104,7 @@ class TriviaBackendStack extends Stack {
       },
     });
 
-    const tg2 = new elb.ApplicationTargetGroup(
+    const greenTargetGroup = new elb.ApplicationTargetGroup(
       this,
       'ServiceTargetGroupGreen',
       {
@@ -149,47 +125,75 @@ class TriviaBackendStack extends Stack {
       }
     );
 
-    // Listeners:
-    // CodeDeploy will shift traffic from blue to green and vice-versa
-    // in both the production and test listeners.
-    // The production listener is used for normal, production traffic.
-    // The test listener is used for test traffic, like integration tests
-    // which can run as part of a CodeDeploy lifecycle event hook prior to
-    // traffic being shifted in the production listener.
-    // Both listeners initially point towards the blue target group.
+    // Production listener with weighted forwarding
     const listener = loadBalancer.addListener('ProductionListener', {
       port: 443,
       protocol: elb.ApplicationProtocol.HTTPS,
       open: true,
       certificates: [certificate],
       sslPolicy: elb.SslPolicy.RECOMMENDED_TLS,
-      defaultAction: elb.ListenerAction.weightedForward([
+    });
+
+    // Production listener rule for blue-green traffic management
+    new elb.ApplicationListenerRule(this, 'ProductionListenerRule', {
+      listener,
+      priority: 1,
+      conditions: [elb.ListenerCondition.pathPatterns(['/*'])],
+      action: elb.ListenerAction.weightedForward([
         {
-          targetGroup: tg1,
+          targetGroup: blueTargetGroup,
           weight: 100,
+        },
+        {
+          targetGroup: greenTargetGroup,
+          weight: 0,
         },
       ]),
     });
 
-    let testListener = loadBalancer.addListener('TestListener', {
-      port: 9002, // test traffic port
-      protocol: elb.ApplicationProtocol.HTTPS,
-      open: true,
-      certificates: [certificate],
-      sslPolicy: elb.SslPolicy.RECOMMENDED_TLS,
-      defaultAction: elb.ListenerAction.weightedForward([
-        {
-          targetGroup: tg1,
-          weight: 100,
-        },
-      ]),
+    // Create lifecycle hook Lambda function
+    const preTrafficHook = new lambda.NodejsFunction(this, 'PreTrafficHook', {
+      entry: './ecs-post-test-traffic-hook.ts',
+      timeout: Duration.minutes(5),
+      environment: {
+        TARGET_URL: `https://${props.domainName}:9002/api/categories/`,
+      },
     });
 
-    // ECS Resources: task definition, service, task set, etc
-    // The CodeDeploy blue-green hook will take care of orchestrating the sequence of steps
-    // that CloudFormation takes during the deployment: the creation of the 'green' task set,
-    // shifting traffic to the new task set, and draining/deleting the 'blue' task set.
-    // The 'blue' task set is initially provisioned, pointing to the 'blue' target group.
+    // Alarms for deployment rollback
+    const blueApiFailure = new cloudwatch.Alarm(this, 'TargetGroupBlue5xx', {
+      alarmName: this.stackName + '-Http-500-Blue',
+      metric: new cloudwatch.Metric({
+        namespace: 'AWS/ApplicationELB',
+        metricName: elb.HttpCodeTarget.TARGET_5XX_COUNT,
+        statistic: 'Sum',
+        dimensionsMap: {
+          TargetGroup: blueTargetGroup.targetGroupFullName,
+          LoadBalancer: loadBalancer.loadBalancerFullName,
+        },
+        period: Duration.minutes(1),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+    });
+
+    const greenApiFailure = new cloudwatch.Alarm(this, 'TargetGroupGreen5xx', {
+      alarmName: this.stackName + '-Http-500-Green',
+      metric: new cloudwatch.Metric({
+        namespace: 'AWS/ApplicationELB',
+        metricName: elb.HttpCodeTarget.TARGET_5XX_COUNT,
+        statistic: 'Sum',
+        dimensionsMap: {
+          TargetGroup: greenTargetGroup.targetGroupFullName,
+          LoadBalancer: loadBalancer.loadBalancerFullName,
+        },
+        period: Duration.minutes(1),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+    });
+
+    // Task definition
     const taskDefinition = new ecs.FargateTaskDefinition(
       this,
       'TaskDefinition',
@@ -201,125 +205,41 @@ class TriviaBackendStack extends Stack {
     });
     container.addPortMappings({ containerPort: 80 });
 
-    const service = new ecs.CfnService(this, 'Service', {
-      cluster: cluster.clusterName,
+    // ECS Service with native blue-green deployment
+    const service = new ecs.FargateService(this, 'Service', {
+      cluster,
+      taskDefinition,
       desiredCount: 3,
-      deploymentController: { type: ecs.DeploymentControllerType.EXTERNAL },
+      securityGroups: [serviceSG],
+      vpcSubnets: {
+        subnetType: ec2.SubnetType.PRIVATE_WITH_NAT,
+      },
+      deploymentStrategy: ecs.DeploymentStrategy.BLUE_GREEN,
+      bakeTime: Duration.minutes(30),
       propagateTags: ecs.PropagatedTagSource.SERVICE,
-      availabilityZoneRebalancing: 'ENABLED',
-    });
-    service.node.addDependency(tg1);
-    service.node.addDependency(tg2);
-    service.node.addDependency(listener);
-    service.node.addDependency(testListener);
-
-    const taskSet = new ecs.CfnTaskSet(this, 'TaskSet', {
-      cluster: cluster.clusterName,
-      service: service.attrName,
-      scale: { unit: 'PERCENT', value: 100 },
-      taskDefinition: taskDefinition.taskDefinitionArn,
-      launchType: ecs.LaunchType.FARGATE,
-      loadBalancers: [
-        {
-          containerName: 'web',
-          containerPort: 80,
-          targetGroupArn: tg1.targetGroupArn,
-        },
-      ],
-      networkConfiguration: {
-        awsVpcConfiguration: {
-          assignPublicIp: 'DISABLED',
-          securityGroups: [serviceSG.securityGroupId],
-          subnets: vpc.selectSubnets({
-            subnetType: ec2.SubnetType.PRIVATE_WITH_NAT,
-          }).subnetIds,
-        },
+      deploymentAlarms: {
+        alarmNames: [blueApiFailure.alarmName, greenApiFailure.alarmName],
+        behavior: ecs.AlarmBehavior.ROLLBACK_ON_ALARM,
       },
+      lifecycleHooks: [new ecs.DeploymentLifecycleLambdaTarget(preTrafficHook, 'PreTrafficHook', {
+        lifecycleStages: [ecs.DeploymentLifecycleStage.POST_TEST_TRAFFIC_SHIFT],
+      })],
+      availabilityZoneRebalancing: ecs.AvailabilityZoneRebalancing.ENABLED,
+      minHealthyPercent: 100,
+      maxHealthyPercent: 200,
     });
 
-    new ecs.CfnPrimaryTaskSet(this, 'PrimaryTaskSet', {
-      cluster: cluster.clusterName,
-      service: service.attrName,
-      taskSetId: taskSet.attrId,
+    // Configure load balancer target with alternate target group
+    const target = service.loadBalancerTarget({
+      containerName: 'web',
+      containerPort: 80,
+      protocol: ecs.Protocol.TCP,
     });
 
-    // CodeDeploy hook and transform to configure the blue-green deployments.
-    //
-    // Note: Stack updates that contain changes in the template to both ECS resources and non-ECS resources
-    // will result in the following error from the CodeDeploy hook:
-    //   "Additional resource diff other than ECS application related resource update is detected,
-    //    CodeDeploy can't perform BlueGreen style update properly."
-    // In this case, you can either:
-    // 1) Separate the resources into multiple, separate stack updates: First, deploy the changes to the
-    //    non-ECS resources only, using the same container image tag during the template synthesis that is
-    //    currently deployed to the ECS service.  Then, deploy the changes to the ECS service, for example
-    //    deploying a new container image tag.  This is the best practice.
-    // 2) Temporarily disable the CodeDeploy blue-green hook: Comment out the CodeDeploy transform and hook
-    //    code below.  The next stack update will *not* deploy the ECS service changes in a blue-green fashion.
-    //    Once the stack update is completed, uncomment the CodeDeploy transform and hook code to re-enable
-    //    blue-green deployments.
-    this.addTransform('AWS::CodeDeployBlueGreen');
-    const taskDefLogicalId = this.getLogicalId(
-      taskDefinition.node.defaultChild as ecs.CfnTaskDefinition
-    );
-    const taskSetLogicalId = this.getLogicalId(taskSet);
-    new CfnCodeDeployBlueGreenHook(this, 'CodeDeployBlueGreenHook', {
-      trafficRoutingConfig: {
-        type: CfnTrafficRoutingType.TIME_BASED_CANARY,
-        timeBasedCanary: {
-          // Shift 20% of prod traffic, then wait 15 minutes
-          stepPercentage: 20,
-          bakeTimeMins: 15,
-        },
-      },
-      additionalOptions: {
-        // After canary period, shift 100% of prod traffic, then wait 30 minutes
-        terminationWaitTimeInMinutes: 30,
-      },
-      lifecycleEventHooks: {
-        // invoke lifecycle event hook function after test traffic is live, but before prod traffic is live
-        afterAllowTestTraffic:
-          'CodeDeployHook_-' + props.deploymentHooksStack + '-pre-traffic-hook',
-      },
-      serviceRole: 'CodeDeployHookRole_' + props.deploymentHooksStack,
-      applications: [
-        {
-          target: {
-            type: service.cfnResourceType,
-            logicalId: this.getLogicalId(service),
-          },
-          ecsAttributes: {
-            taskDefinitions: [taskDefLogicalId, taskDefLogicalId + 'Green'],
-            taskSets: [taskSetLogicalId, taskSetLogicalId + 'Green'],
-            trafficRouting: {
-              prodTrafficRoute: {
-                type: elb.CfnListener.CFN_RESOURCE_TYPE_NAME,
-                logicalId: this.getLogicalId(
-                  listener.node.defaultChild as elb.CfnListener
-                ),
-              },
-              testTrafficRoute: {
-                type: elb.CfnListener.CFN_RESOURCE_TYPE_NAME,
-                logicalId: this.getLogicalId(
-                  testListener.node.defaultChild as elb.CfnListener
-                ),
-              },
-              targetGroups: [
-                this.getLogicalId(tg1.node.defaultChild as elb.CfnTargetGroup),
-                this.getLogicalId(tg2.node.defaultChild as elb.CfnTargetGroup),
-              ],
-            },
-          },
-        },
-      ],
-    });
+    target.attachToApplicationTargetGroup(blueTargetGroup);
 
-    // Alarms:
-    // These resources alarm on unhealthy hosts and HTTP 500s at the target group level.
-    // In order to have stack updates automatically rollback based on these alarms,
-    // the alarms need to manually be configured as rollback triggers on the stack
-    // after the stack is created.
-    const tg1UnhealthyHosts = new cloudwatch.Alarm(
+    // Alarms for monitoring
+    const blueUnhealthyHosts = new cloudwatch.Alarm(
       this,
       'TargetGroupBlueUnhealthyHosts',
       {
@@ -329,7 +249,7 @@ class TriviaBackendStack extends Stack {
           metricName: 'UnHealthyHostCount',
           statistic: 'Average',
           dimensionsMap: {
-            TargetGroup: tg1.targetGroupFullName,
+            TargetGroup: blueTargetGroup.targetGroupFullName,
             LoadBalancer: loadBalancer.loadBalancerFullName,
           },
         }),
@@ -338,23 +258,7 @@ class TriviaBackendStack extends Stack {
       }
     );
 
-    const tg1ApiFailure = new cloudwatch.Alarm(this, 'TargetGroupBlue5xx', {
-      alarmName: this.stackName + '-Http-500-Blue',
-      metric: new cloudwatch.Metric({
-        namespace: 'AWS/ApplicationELB',
-        metricName: elb.HttpCodeTarget.TARGET_5XX_COUNT,
-        statistic: 'Sum',
-        dimensionsMap: {
-          TargetGroup: tg1.targetGroupFullName,
-          LoadBalancer: loadBalancer.loadBalancerFullName,
-        },
-        period: Duration.minutes(1),
-      }),
-      threshold: 1,
-      evaluationPeriods: 1,
-    });
-
-    const tg2UnhealthyHosts = new cloudwatch.Alarm(
+    const greenUnhealthyHosts = new cloudwatch.Alarm(
       this,
       'TargetGroupGreenUnhealthyHosts',
       {
@@ -364,7 +268,7 @@ class TriviaBackendStack extends Stack {
           metricName: 'UnHealthyHostCount',
           statistic: 'Average',
           dimensionsMap: {
-            TargetGroup: tg2.targetGroupFullName,
+            TargetGroup: greenTargetGroup.targetGroupFullName,
             LoadBalancer: loadBalancer.loadBalancerFullName,
           },
         }),
@@ -373,31 +277,15 @@ class TriviaBackendStack extends Stack {
       }
     );
 
-    const tg2ApiFailure = new cloudwatch.Alarm(this, 'TargetGroupGreen5xx', {
-      alarmName: this.stackName + '-Http-500-Green',
-      metric: new cloudwatch.Metric({
-        namespace: 'AWS/ApplicationELB',
-        metricName: elb.HttpCodeTarget.TARGET_5XX_COUNT,
-        statistic: 'Sum',
-        dimensionsMap: {
-          TargetGroup: tg2.targetGroupFullName,
-          LoadBalancer: loadBalancer.loadBalancerFullName,
-        },
-        period: Duration.minutes(1),
-      }),
-      threshold: 1,
-      evaluationPeriods: 1,
-    });
-
     new cloudwatch.CompositeAlarm(this, 'CompositeUnhealthyHosts', {
       compositeAlarmName: this.stackName + '-Unhealthy-Hosts',
       alarmRule: cloudwatch.AlarmRule.anyOf(
         cloudwatch.AlarmRule.fromAlarm(
-          tg1UnhealthyHosts,
+          blueUnhealthyHosts,
           cloudwatch.AlarmState.ALARM
         ),
         cloudwatch.AlarmRule.fromAlarm(
-          tg2UnhealthyHosts,
+          greenUnhealthyHosts,
           cloudwatch.AlarmState.ALARM
         )
       ),
@@ -407,11 +295,11 @@ class TriviaBackendStack extends Stack {
       compositeAlarmName: this.stackName + '-Http-500',
       alarmRule: cloudwatch.AlarmRule.anyOf(
         cloudwatch.AlarmRule.fromAlarm(
-          tg1ApiFailure,
+          blueApiFailure,
           cloudwatch.AlarmState.ALARM
         ),
         cloudwatch.AlarmRule.fromAlarm(
-          tg2ApiFailure,
+          greenApiFailure,
           cloudwatch.AlarmState.ALARM
         )
       ),
@@ -423,7 +311,6 @@ const app = new App();
 new TriviaBackendStack(app, 'TriviaBackendTest', {
   domainName: 'api-test.reinvent-trivia.com',
   domainZone: 'reinvent-trivia.com',
-  deploymentHooksStack: 'TriviaBackendHooksTest',
   env: { account: process.env['CDK_DEFAULT_ACCOUNT'], region: 'us-east-1' },
   tags: {
     project: 'reinvent-trivia',
@@ -432,7 +319,6 @@ new TriviaBackendStack(app, 'TriviaBackendTest', {
 new TriviaBackendStack(app, 'TriviaBackendProd', {
   domainName: 'api.reinvent-trivia.com',
   domainZone: 'reinvent-trivia.com',
-  deploymentHooksStack: 'TriviaBackendHooksProd',
   env: { account: process.env['CDK_DEFAULT_ACCOUNT'], region: 'us-east-1' },
   tags: {
     project: 'reinvent-trivia',
