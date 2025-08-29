@@ -181,19 +181,8 @@ export class TriviaGameContainersCfnPipeline extends Construct {
         }));
 
         buildProject.addToRolePolicy(new iam.PolicyStatement({
-            actions: [
-                "s3:GetObject*",
-                "s3:GetBucket*",
-                "s3:List*",
-                "s3:DeleteObject*",
-                "s3:PutObject",
-                "s3:PutObjectLegalHold",
-                "s3:PutObjectRetention",
-                "s3:PutObjectTagging",
-                "s3:PutObjectVersionTagging",
-                "s3:Abort*"
-            ],
-            resources: ["arn:aws:s3:::cdk*"]
+            actions: ["sts:AssumeRole"],
+            resources: [`arn:aws:iam::${Stack.of(this).account}:role/cdk-*-file-publishing-role-${Stack.of(this).account}-${Stack.of(this).region}`]
         }));
 
         const buildArtifact = new codepipeline.Artifact('BuildArtifact');
