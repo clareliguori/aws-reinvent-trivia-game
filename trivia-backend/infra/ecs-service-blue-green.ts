@@ -126,7 +126,7 @@ class TriviaBackendStack extends Stack {
     );
 
     // Production listener with weighted forwarding
-    const listener = loadBalancer.addListener('ProductionListener', {
+    loadBalancer.addListener('ProductionListener', {
       port: 443,
       protocol: elb.ApplicationProtocol.HTTPS,
       open: true,
