@@ -125,28 +125,33 @@ class TriviaBackendStack extends Stack {
       }
     );
 
-    // Production listener with weighted forwarding
-    loadBalancer.addListener('ProductionListener', {
+    const productionListener = loadBalancer.addListener('ProductionListener', {
       port: 443,
       protocol: elb.ApplicationProtocol.HTTPS,
       open: true,
       certificates: [certificate],
       sslPolicy: elb.SslPolicy.RECOMMENDED_TLS,
-      defaultAction: elb.ListenerAction.weightedForward([
-        {
-          targetGroup: blueTargetGroup,
-          weight: 100,
-        },
-        {
-          targetGroup: greenTargetGroup,
-          weight: 0,
-        },
-      ]),
+      defaultAction: elb.ListenerAction.fixedResponse(404, {
+        contentType: 'text/plain',
+        messageBody: 'Not Found',
+      }),
+    });
+
+    const testListener = loadBalancer.addListener('TestListener', {
+      port: 9002,
+      protocol: elb.ApplicationProtocol.HTTPS,
+      open: true,
+      certificates: [certificate],
+      sslPolicy: elb.SslPolicy.RECOMMENDED_TLS,
+      defaultAction: elb.ListenerAction.fixedResponse(404, {
+        contentType: 'text/plain',
+        messageBody: 'Not Found',
+      }),
     });
 
 
 
-    // Create lifecycle hook Lambda function
+    // Lifecycle hook Lambda function that will test through the test listener port
     const preTrafficHook = new lambda.NodejsFunction(this, 'PreTrafficHook', {
       entry: './ecs-post-test-traffic-hook.ts',
       timeout: Duration.minutes(5),
@@ -224,11 +229,49 @@ class TriviaBackendStack extends Stack {
       maxHealthyPercent: 200,
     });
 
-    // Configure load balancer target with alternate target group
+    const productionRule = new elb.ApplicationListenerRule(this, 'ProductionRule', {
+      listener: productionListener,
+      priority: 1,
+      conditions: [elb.ListenerCondition.pathPatterns(['*'])],
+      action: elb.ListenerAction.weightedForward([
+        {
+          targetGroup: blueTargetGroup,
+          weight: 100,
+        },
+        {
+          targetGroup: greenTargetGroup,
+          weight: 0,
+        },
+      ]),
+    });
+
+    const testRule = new elb.ApplicationListenerRule(this, 'TestRule', {
+      listener: testListener,
+      priority: 1,
+      conditions: [elb.ListenerCondition.pathPatterns(['*'])],
+      action: elb.ListenerAction.weightedForward([
+        {
+          targetGroup: blueTargetGroup,
+          weight: 100,
+        },
+        {
+          targetGroup: greenTargetGroup,
+          weight: 0,
+        },
+      ]),
+    });
+
+    const alternateTarget = new ecs.AlternateTarget('GreenTarget', {
+      alternateTargetGroup: greenTargetGroup,
+      productionListener: ecs.ListenerRuleConfiguration.applicationListenerRule(productionRule),
+      testListener: ecs.ListenerRuleConfiguration.applicationListenerRule(testRule),
+    });
+
     const target = service.loadBalancerTarget({
       containerName: 'web',
       containerPort: 80,
       protocol: ecs.Protocol.TCP,
+      alternateTarget,
     });
 
     target.attachToApplicationTargetGroup(blueTargetGroup);
