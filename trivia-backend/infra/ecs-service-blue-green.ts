@@ -132,14 +132,7 @@ class TriviaBackendStack extends Stack {
       open: true,
       certificates: [certificate],
       sslPolicy: elb.SslPolicy.RECOMMENDED_TLS,
-    });
-
-    // Production listener rule for blue-green traffic management
-    new elb.ApplicationListenerRule(this, 'ProductionListenerRule', {
-      listener,
-      priority: 1,
-      conditions: [elb.ListenerCondition.pathPatterns(['/*'])],
-      action: elb.ListenerAction.weightedForward([
+      defaultAction: elb.ListenerAction.weightedForward([
         {
           targetGroup: blueTargetGroup,
           weight: 100,
@@ -150,6 +143,8 @@ class TriviaBackendStack extends Stack {
         },
       ]),
     });
+
+
 
     // Create lifecycle hook Lambda function
     const preTrafficHook = new lambda.NodejsFunction(this, 'PreTrafficHook', {
