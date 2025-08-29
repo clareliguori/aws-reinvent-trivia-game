@@ -182,14 +182,16 @@ export class TriviaGameContainersCfnPipeline extends Construct {
 
         buildProject.addToRolePolicy(new iam.PolicyStatement({
             actions: [
+                "s3:GetObject*",
+                "s3:GetBucket*",
+                "s3:List*",
+                "s3:DeleteObject*",
                 "s3:PutObject",
-                "s3:AbortMultipartUpload",
-                "s3:ListMultipartUploadParts",
-                "s3:GetObject",
-                "s3:GetObjectVersion",
-                "s3:ListBucket",
-                "s3:GetBucketLocation",
-                "s3:GetEncryptionConfiguration"
+                "s3:PutObjectLegalHold",
+                "s3:PutObjectRetention",
+                "s3:PutObjectTagging",
+                "s3:PutObjectVersionTagging",
+                "s3:Abort*"
             ],
             resources: ["arn:aws:s3:::cdk*"]
         }));

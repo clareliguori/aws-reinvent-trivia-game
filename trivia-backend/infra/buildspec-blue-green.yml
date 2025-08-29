@@ -39,6 +39,7 @@ phases:
       - npm ci
       - npm run build
       - cdk synth -o build --app 'node ecs-service-blue-green.js'
+      - aws s3api get-bucket-location --bucket cdk-hnb659fds-assets-131296546870-us-east-1 --expected-bucket-owner 131296546870
       - cdk-assets publish -p build/TriviaBackendTest.assets.json
       - cdk-assets publish -p build/TriviaBackendProd.assets.json
       - cp StackConfig.json build/
