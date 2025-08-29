@@ -180,6 +180,20 @@ export class TriviaGameContainersCfnPipeline extends Construct {
             resources: ["*"]
         }));
 
+        buildProject.addToRolePolicy(new iam.PolicyStatement({
+            actions: [
+                "s3:PutObject",
+                "s3:AbortMultipartUpload",
+                "s3:ListMultipartUploadParts",
+                "s3:GetObject",
+                "s3:GetObjectVersion",
+                "s3:ListBucket",
+                "s3:GetBucketLocation",
+                "s3:GetEncryptionConfiguration"
+            ],
+            resources: ["arn:aws:s3:::cdk*"]
+        }));
+
         const buildArtifact = new codepipeline.Artifact('BuildArtifact');
         const buildAction = new actions.CodeBuildAction({
             actionName: 'CodeBuild',
